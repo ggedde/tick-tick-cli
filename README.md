@@ -45,19 +45,7 @@ chmod +x ticktick.sh
 nano ticktick.sh
 ```
 
-### 3. Add Your Credentials
-
-Edit the script and add your TickTick app credentials:
-
-```bash
-CLIENT_ID="your_client_id_here"
-CLIENT_SECRET="your_client_secret_here"
-ACCESS_TOKEN=""
-REFRESH_TOKEN=""
-TOKEN_EXPIRY=""
-```
-
-### 4. Initial Setup (Credentials & OAuth)
+### 3. Initial Setup (Credentials & OAuth)
 
 ```bash
 # The script uses a single config file at ~/.config/ticktick-cli
@@ -85,7 +73,7 @@ chmod 600 ~/.config/ticktick-cli
 # are saved back to ~/.config/ticktick-cli automatically.
 ```
 
-### 5. Create Alias (Optional)
+### 4. Create Alias (Optional)
 
 Add to your `~/.zshrc` or `~/.bash_profile`:
 
