@@ -30,8 +30,9 @@
 #       POSIX-safe: DESC="$(printf 'First line\n\nSecond paragraph')"; task "Title" --description "$DESC"
 #
 #   complete - Mark task complete
-#     Flags: --task (name or ID), --list (name, required)
-#     Output: --json, --json-pretty (default: human-readable)
+#     Positional: [name] (multi-word unquoted names supported)
+#     Flags: --name/-n (name), --id/-i (task ID), --list/-l (optional), --tag/-t (add after completion)
+#     Output: --json/-j, --json-pretty/-jp (default: human-readable)
 #     Special: --list "Inbox" or --list "inbox" (case-insensitive)
 #
 #   tasks - List tasks
@@ -114,10 +115,10 @@
 #     task --id 1234567890abcdef12345678 --list "Target List"
 #
 #   COMPLETE:
-#     complete --task "Fix bug" --list "Work"
-#     complete --task "1234567890abcdef12345678" --list "Work"
-#     complete --task "Make Something Awesome folk's" --list "Work"
-#     complete --task "Inbox task" --list "Inbox"
+#     complete Fix bug --list Work
+#     complete --id 1234567890abcdef12345678 --tag Done
+#     complete "Make Something Awesome folk's" --list Work
+#     complete Inbox task --list Inbox
 #
 #   TASKS - List Tasks:
 #     tasks --list "Work"
@@ -584,6 +585,7 @@ task() {
     local tag=""
     local update_mode=false
     local output_format="human"
+    local add_tag_after=""
     local new_title=""
     local provided_task_id=""
     
@@ -787,6 +789,208 @@ except Exception as e:
         # Check if search key looks like a task ID (24 hex characters)
         if [[ -z "$task_id" && "$search_key" =~ ^[a-f0-9]{24}$ ]]; then
             task_id="$search_key"
+        fi
+
+        # Fast path: If updating by --id and no --list move requested, find projectId first
+        if [[ -n "$task_id" && -z "$list" ]]; then
+            # Locate projectId by scanning projects (including Inbox)
+            local projects_response=$(curl -s -X GET "https://api.ticktick.com/open/v1/project" \
+                -H "Authorization: Bearer $ACCESS_TOKEN")
+            local located_pid=$(echo "$projects_response" | python3 -c "
+import json, sys, subprocess
+try:
+    projects = json.loads(sys.stdin.read())
+    token = sys.argv[1]
+    tid = sys.argv[2]
+    # Check Inbox first
+    cmd = ['curl','-s','-X','GET', 'https://api.ticktick.com/open/v1/project/inbox/data','-H', f'Authorization: Bearer {token}']
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            data = json.loads(res.stdout)
+            for t in data.get('tasks', []):
+                if str(t.get('id')) == tid:
+                    print(t.get('projectId', 'inbox'))
+                    raise SystemExit(0)
+        except:
+            pass
+    # Then check other projects
+    for project in projects:
+        pid = project.get('id')
+        if not pid:
+            continue
+        cmd = ['curl','-s','-X','GET', f'https://api.ticktick.com/open/v1/project/{pid}/data','-H', f'Authorization: Bearer {token}']
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            continue
+        try:
+            data = json.loads(res.stdout)
+        except:
+            continue
+        for t in data.get('tasks', []):
+            if str(t.get('id')) == tid:
+                print(t.get('projectId', pid))
+                raise SystemExit(0)
+except:
+    pass
+" "$ACCESS_TOKEN" "$task_id")
+            
+            # Build minimal payload from provided fields only
+            local update_payload=$(python3 -c "
+import json, sys
+
+new_title = sys.argv[1] if len(sys.argv) > 1 else ''
+description = sys.argv[2] if len(sys.argv) > 2 else ''
+priority_int = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0
+due_date_formatted = sys.argv[4] if len(sys.argv) > 4 else ''
+tag = sys.argv[5] if len(sys.argv) > 5 else ''
+project_id = sys.argv[6] if len(sys.argv) > 6 else ''
+
+data = {}
+if new_title:
+    data['title'] = new_title
+if description:
+    data['content'] = description
+if priority_int != 0:
+    data['priority'] = priority_int
+if due_date_formatted:
+    data['dueDate'] = due_date_formatted
+if tag:
+    data['tags'] = [t.strip() for t in tag.split(',') if t.strip()]
+# Include projectId for non-Inbox tasks
+if project_id and not project_id.startswith('inbox'):
+    data['projectId'] = project_id
+
+print(json.dumps(data))
+" "${new_title:-}" "$description" "$priority_int" "$due_date_formatted" "$tag" "$located_pid")
+
+            # Use project-specific endpoint for Inbox, generic for others
+            if [[ "$located_pid" == inbox* ]]; then
+                local update_result=$(curl -s -w "\n%{http_code}" -X POST "https://api.ticktick.com/open/v1/project/$located_pid/task/$task_id" \
+                    -H "Authorization: Bearer $ACCESS_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d "$update_payload")
+            else
+                local update_result=$(curl -s -w "\n%{http_code}" -X POST "https://api.ticktick.com/open/v1/task/$task_id" \
+                    -H "Authorization: Bearer $ACCESS_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d "$update_payload")
+            fi
+            local http_status=$(echo "$update_result" | tail -n1)
+            local update_response=$(echo "$update_result" | sed '$d')
+
+            if [[ "$http_status" == 200 || "$http_status" == 204 ]]; then
+                case "$output_format" in
+                    json|json-pretty)
+                        # If body empty, synthesize minimal success
+                        if [[ -z "$update_response" ]]; then
+                            update_response="{\"id\": \"$task_id\"}"
+                        fi
+                        echo "$update_response" | python3 -c "
+$PYTHON_HELPERS
+import json, sys
+
+try:
+    task_data = json.loads(sys.stdin.read())
+    output = {
+        'success': True,
+        'action': 'updated',
+        'task': task_data
+    }
+    indent = 2 if '$output_format' == 'json-pretty' else None
+    print(json.dumps(output, indent=indent))
+except Exception as e:
+    print(json.dumps({'success': True, 'action': 'updated', 'id': '$task_id'}, indent=2 if '$output_format' == 'json-pretty' else None))
+"
+                        ;;
+                    table)
+                        ;;
+                    *)
+                        printf '\033[32mTask updated successfully! ID: %s\033[0m\n' "$task_id"
+                        ;;
+                esac
+                # If tags were provided, ensure they apply by including projectId fallback
+                if [[ -n "$tag" ]]; then
+                    # First, try to get the task directly to extract its projectId
+                    local direct_response=$(curl -s -X GET "https://api.ticktick.com/open/v1/task/$task_id" \
+                        -H "Authorization: Bearer $ACCESS_TOKEN")
+                    local located_pid=$(echo "$direct_response" | python3 -c "
+import json, sys
+try:
+    task = json.loads(sys.stdin.read())
+    if 'projectId' in task:
+        print(task['projectId'])
+        raise SystemExit(0)
+except:
+    pass
+")
+                    # If direct fetch didn't work, fall back to scanning projects
+                    if [[ -z "$located_pid" ]]; then
+                        local projects_response=$(curl -s -X GET "https://api.ticktick.com/open/v1/project" \
+                            -H "Authorization: Bearer $ACCESS_TOKEN")
+                        located_pid=$(echo "$projects_response" | python3 -c "
+import json, sys, subprocess
+try:
+    projects = json.loads(sys.stdin.read())
+    token = sys.argv[1]
+    tid = sys.argv[2]
+    # Check Inbox first
+    cmd = ['curl','-s','-X','GET', 'https://api.ticktick.com/open/v1/project/inbox/data','-H', f'Authorization: Bearer {token}']
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            data = json.loads(res.stdout)
+            for t in data.get('tasks', []):
+                if str(t.get('id')) == tid:
+                    print(t.get('projectId', 'inbox'))
+                    raise SystemExit(0)
+        except:
+            pass
+    # Then check other projects
+    for project in projects:
+        pid = project.get('id')
+        if not pid:
+            continue
+        cmd = ['curl','-s','-X','GET', f'https://api.ticktick.com/open/v1/project/{pid}/data','-H', f'Authorization: Bearer {token}']
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            continue
+        try:
+            data = json.loads(res.stdout)
+        except:
+            continue
+        for t in data.get('tasks', []):
+            if str(t.get('id')) == tid:
+                print(t.get('projectId', pid))
+                raise SystemExit(0)
+except:
+    pass
+" "$ACCESS_TOKEN" "$task_id")
+                    fi
+                    if [[ -n "$located_pid" ]]; then
+                        # Use project-specific endpoint for Inbox, generic endpoint with projectId for others
+                        if [[ "$located_pid" == inbox* ]]; then
+                            local tag_payload=$(python3 -c "import json,sys; print(json.dumps({'tags':[t.strip() for t in sys.argv[1].split(',') if t.strip()]}))" "$tag")
+                            curl -s -X POST "https://api.ticktick.com/open/v1/project/$located_pid/task/$task_id" \
+                                -H "Authorization: Bearer $ACCESS_TOKEN" \
+                                -H "Content-Type: application/json" \
+                                -d "$tag_payload" >/dev/null 2>&1 || true
+                        else
+                            local tag_payload=$(python3 -c "import json,sys; print(json.dumps({'tags':[t.strip() for t in sys.argv[1].split(',') if t.strip()], 'projectId': sys.argv[2]}))" "$tag" "$located_pid")
+                            curl -s -X POST "https://api.ticktick.com/open/v1/task/$task_id" \
+                                -H "Authorization: Bearer $ACCESS_TOKEN" \
+                                -H "Content-Type: application/json" \
+                                -d "$tag_payload" >/dev/null 2>&1 || true
+                        fi
+                    fi
+                fi
+                return 0
+            else
+                echo "Error: Failed to update task by ID"
+                echo "HTTP Status: $http_status"
+                [[ -n "$update_response" ]] && echo "Response: $update_response"
+                return 1
+            fi
         fi
         
         if [[ -n "$list" ]]; then
@@ -1373,71 +1577,239 @@ complete_task() {
     local task_identifier=""
     local list_name=""
     local output_format="human"
+    local add_tag_after=""
+    
+    # Collect positional name until first option
+    local collected_name=""
+    local parsing_name=true
     
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --task)
+            --task|--name|-n)
+                parsing_name=false
+                shift
+                if [[ $# -eq 0 || "$1" == --* || "$1" == -* ]]; then
+                    echo "Error: --name requires a value"
+                    return 1
+                fi
+                task_identifier=""
+                while [[ $# -gt 0 && "$1" != --* && "$1" != -* ]]; do
+                    if [[ -z "$task_identifier" ]]; then
+                        task_identifier="$1"
+                    else
+                        task_identifier+=" $1"
+                    fi
+                    shift
+                done
+                ;;
+            --id|-i)
+                parsing_name=false
                 task_identifier="$2"
                 shift 2
                 ;;
-            --list)
+            --list|-l)
+                parsing_name=false
                 list_name="$2"
                 shift 2
                 ;;
-            --json)
+            --tag|-t)
+                parsing_name=false
+                add_tag_after="$2"
+                shift 2
+                ;;
+            --json|-j)
+                parsing_name=false
                 output_format="json"
                 shift
                 ;;
-            --json-pretty)
+            --json-pretty|-jp)
+                parsing_name=false
                 output_format="json-pretty"
                 shift
                 ;;
-            
-            -*)
-                echo "Error: Unknown option $1"
-                return 1
+            --*)
+                parsing_name=false
+                shift
                 ;;
             *)
-                echo "Error: Unexpected argument $1"
-                return 1
+                if $parsing_name; then
+                    if [[ -z "$collected_name" ]]; then
+                        collected_name="$1"
+                    else
+                        collected_name+=" $1"
+                    fi
+                    shift
+                    continue
+                else
+                    shift
+                    continue
+                fi
                 ;;
         esac
     done
     
+    if [[ -z "$task_identifier" && -n "$collected_name" ]]; then
+        task_identifier="$collected_name"
+    fi
+    
     if [[ -z "$task_identifier" ]]; then
-        echo "Error: Task is required (use --task <name or id>)"
+        echo "Error: Task is required (use name or --id)"
         return 1
     fi
     
-    if [[ -z "$list_name" ]]; then
-        echo "Error: List name is required (use --list <name>)"
-        return 1
-    fi
-    
-    # Get project ID from list name (handle Inbox special case)
+    # Determine project and task based on inputs
     local project_id=""
-    if [[ "$list_name" == "Inbox" ]] || [[ "$list_name" == "inbox" ]]; then
-        # Inbox has a special project ID
-        project_id="inbox"
+    local task_id=""
+    if [[ "$task_identifier" =~ ^[a-f0-9]{24}$ ]]; then
+        # Identifier is a task ID
+        task_id="$task_identifier"
+        if [[ -n "$list_name" ]]; then
+            # Use provided list to resolve project
+            if [[ "$list_name" == "Inbox" ]] || [[ "$list_name" == "inbox" ]]; then
+                project_id="inbox"
+            else
+                project_id=$(get_project_id "$list_name")
+                if [[ -z "$project_id" ]]; then
+                    echo "Error: List '$list_name' not found"
+                    return 1
+                fi
+            fi
+        else
+            # No list provided; search all projects (including Inbox) for this task ID
+            local projects_response=$(curl -s -X GET "https://api.ticktick.com/open/v1/project" \
+                -H "Authorization: Bearer $ACCESS_TOKEN")
+            local located=$(echo "$projects_response" | python3 -c "
+import json, sys, subprocess
+try:
+    projects = json.loads(sys.stdin.read())
+    token = sys.argv[1]
+    tid = sys.argv[2]
+    # Check Inbox first
+    cmd = ['curl','-s','-X','GET', 'https://api.ticktick.com/open/v1/project/inbox/data','-H', f'Authorization: Bearer {token}']
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            data = json.loads(res.stdout)
+            for t in data.get('tasks', []):
+                if str(t.get('id')) == tid:
+                    print('inbox')
+                    raise SystemExit(0)
+        except:
+            pass
+    # Then check other projects
+    for project in projects:
+        pid = project.get('id')
+        if not pid:
+            continue
+        cmd = ['curl','-s','-X','GET', f'https://api.ticktick.com/open/v1/project/{pid}/data','-H', f'Authorization: Bearer {token}']
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            continue
+        try:
+            data = json.loads(res.stdout)
+        except:
+            continue
+        for t in data.get('tasks', []):
+            if str(t.get('id')) == tid:
+                print(pid)
+                raise SystemExit(0)
+except:
+    pass
+" "$ACCESS_TOKEN" "$task_id")
+            if [[ -z "$located" ]]; then
+                echo "Error: Could not find task ID '$task_id' in any project"
+                return 1
+            fi
+            project_id="$located"
+        fi
     else
-        project_id=$(get_project_id "$list_name")
-        if [[ -z "$project_id" ]]; then
-            echo "Error: List '$list_name' not found"
-            return 1
+        # Identifier is a task title
+        if [[ -n "$list_name" ]]; then
+            # Resolve within a specific list
+            if [[ "$list_name" == "Inbox" ]] || [[ "$list_name" == "inbox" ]]; then
+                project_id="inbox"
+            else
+                project_id=$(get_project_id "$list_name")
+                if [[ -z "$project_id" ]]; then
+                    echo "Error: List '$list_name' not found"
+                    return 1
+                fi
+            fi
+            task_id=$(get_task_id_from_project "$project_id" "$task_identifier")
+            if [[ -z "$task_id" ]]; then
+                echo "Error: Task '$task_identifier' not found in list '$list_name'"
+                return 1
+            fi
+        else
+            # Search across all projects (including Inbox) for first title match
+            local projects_response=$(curl -s -X GET "https://api.ticktick.com/open/v1/project" \
+                -H "Authorization: Bearer $ACCESS_TOKEN")
+            local found=$(echo "$projects_response" | python3 -c "
+import json, sys, subprocess, re
+
+def normalize_name(name):
+    return re.sub(r'[^a-zA-Z0-9_\- ]', '', name).strip().lower()
+
+try:
+    projects = json.loads(sys.stdin.read())
+    token = sys.argv[1]
+    target = normalize_name(sys.argv[2])
+    # Check Inbox first
+    cmd = ['curl','-s','-X','GET', 'https://api.ticktick.com/open/v1/project/inbox/data','-H', f'Authorization: Bearer {token}']
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode == 0:
+        try:
+            data = json.loads(res.stdout)
+            for t in data.get('tasks', []):
+                title = normalize_name(t.get('title',''))
+                if title == target:
+                    print(str(t.get('id')) + '|inbox')
+                    raise SystemExit(0)
+        except:
+            pass
+    # Then check other projects
+    for project in projects:
+        pid = project.get('id')
+        if not pid:
+            continue
+        cmd = ['curl','-s','-X','GET', f'https://api.ticktick.com/open/v1/project/{pid}/data','-H', f'Authorization: Bearer {token}']
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            continue
+        try:
+            data = json.loads(res.stdout)
+        except:
+            continue
+        for t in data.get('tasks', []):
+            title = normalize_name(t.get('title',''))
+            if title == target:
+                print(str(t.get('id')) + '|' + pid)
+                raise SystemExit(0)
+except:
+    pass
+" "$ACCESS_TOKEN" "$(python3 -c "import re;print(re.sub(r'[^a-zA-Z0-9_\- ]','', '$task_identifier').strip().lower())")")
+            if [[ -z "$found" ]]; then
+                echo "Error: Task '$task_identifier' not found in any list"
+                return 1
+            fi
+            task_id=$(echo "$found" | cut -d'|' -f1)
+            project_id=$(echo "$found" | cut -d'|' -f2)
         fi
     fi
     
-    # Determine if task_identifier is an ID or name
-    local task_id=""
-    if [[ "$task_identifier" =~ ^[a-f0-9]{24}$ ]]; then
-        # Looks like a task ID (24 hex characters)
-        task_id="$task_identifier"
-    else
-        # Treat as task name
-        task_id=$(get_task_id_from_project "$project_id" "$task_identifier")
-        if [[ -z "$task_id" ]]; then
-            echo "Error: Task '$task_identifier' not found in list '$list_name'"
+    # If a tag was requested, add it BEFORE completing the task
+    # The task command will handle finding the projectId automatically
+    if [[ -n "$add_tag_after" ]]; then
+        local tag_update_response=$("$0" task --id "$task_id" --tag "$add_tag_after" --json 2>&1)
+        # Check if tag update failed
+        if [[ "$tag_update_response" == *"error"* ]] && [[ "$tag_update_response" != *"success\": true"* ]]; then
+            echo "Error: Failed to add tag before completing task"
+            if [[ "$output_format" == "json" || "$output_format" == "json-pretty" ]]; then
+                echo "$tag_update_response"
+            else
+                echo "Tag update response: $tag_update_response"
+            fi
             return 1
         fi
     fi
@@ -1481,7 +1853,11 @@ except Exception as e:
         # Format success output based on format type
         case "$output_format" in
             json|json-pretty)
-                echo "{\"success\": true, \"action\": \"completed\", \"task\": \"$task_identifier\", \"list\": \"$list_name\"}" | python3 -c "
+                # Include tag update response if there was one
+                if [[ -n "$add_tag_after" && -n "$tag_update_response" ]]; then
+                    echo "$tag_update_response"
+                else
+                    echo "{\"success\": true, \"action\": \"completed\", \"task\": \"$task_identifier\", \"taskId\": \"$task_id\", \"list\": \"$list_name\"}" | python3 -c "
 $PYTHON_HELPERS
 import json, sys
 
@@ -1492,11 +1868,15 @@ try:
 except Exception as e:
     print(json.dumps({'success': False, 'error': str(e)}, indent=2 if '$output_format' == 'json-pretty' else None))
 "
+                fi
                 ;;
             table)
                 ;;
             *)
-                printf '\033[32mTask %s marked as complete!\033[0m\n' "$task_identifier"
+                printf '\033[32mTask %s marked as complete! (ID: %s)\033[0m\n' "$task_identifier" "$task_id"
+                if [[ -n "$add_tag_after" ]]; then
+                    echo "Tag '$add_tag_after' added before completion"
+                fi
                 ;;
         esac
     fi
@@ -1505,16 +1885,29 @@ except Exception as e:
 # Show tasks
 tasks() {
     local list=""
-    local status=""
+    local status="all"
     # Default to table view
     local output_format="table"
     
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --list)
-                list="$2"
-                shift 2
+            --list|-l)
+                # Support unquoted multi-word list names: consume tokens until next option
+                shift
+                if [[ $# -eq 0 || "$1" == --* || "$1" == -* ]]; then
+                    echo "Error: --list requires a list name"
+                    return 1
+                fi
+                list=""
+                while [[ $# -gt 0 && "$1" != --* && "$1" != -* ]]; do
+                    if [[ -z "$list" ]]; then
+                        list="$1"
+                    else
+                        list+=" $1"
+                    fi
+                    shift
+                done
                 ;;
             --status)
                 status="$2"
@@ -1555,54 +1948,69 @@ tasks() {
             fi
         fi
         
-        # Get project data
+        # Get pending tasks
         local response=$(curl -s -X GET "https://api.ticktick.com/open/v1/project/$project_id/data" \
             -H "Authorization: Bearer $ACCESS_TOKEN")
+        # Optionally get completed tasks (some APIs separate these)
+        local completed_response=""
+        if [[ "$status" == "completed" || "$status" == "all" ]]; then
+            completed_response=$(curl -s -X GET "https://api.ticktick.com/open/v1/project/$project_id/task/completed?from=0" \
+                -H "Authorization: Bearer $ACCESS_TOKEN")
+        fi
         
         # Parse and display tasks from single project
         case "$output_format" in
             json|json-pretty)
-                echo "$response" | python3 -c "
+                # Merge pending + completed and apply status filter
+                local sep=$'\x1e'
+                echo "${response}${sep}${completed_response}" | python3 -c "
 $PYTHON_HELPERS
 import json, sys
 
 try:
-    response_data = sys.stdin.read()
-    term_width = int(sys.argv[1])
-    data = json.loads(response_data)
-    term_width = int(sys.argv[1])
-    
-    # Check if it's an error response
-    if 'errorCode' in data:
+    blob = sys.stdin.read()
+    parts = blob.split('\x1e')
+    pending = json.loads(parts[0]) if parts and parts[0].strip() else {}
+    completed_raw = parts[1] if len(parts) > 1 else ''
+    completed = []
+    if completed_raw.strip():
+        try:
+            parsed = json.loads(completed_raw)
+            if isinstance(parsed, list):
+                completed = parsed
+            elif isinstance(parsed, dict):
+                completed = parsed.get('tasks', parsed.get('completedTasks', []))
+        except:
+            completed = []
+
+    if 'errorCode' in pending:
         output = {
             'success': False,
-            'error': data.get('errorMessage', 'Unknown error'),
-            'errorCode': data.get('errorCode', 'Unknown')
+            'error': pending.get('errorMessage', 'Unknown error'),
+            'errorCode': pending.get('errorCode', 'Unknown')
         }
         indent = 2 if '$output_format' == 'json-pretty' else None
         print(json.dumps(output, indent=indent))
         sys.exit(1)
-    
-    tasks = data.get('tasks', [])
-    
-    # Add human-readable fields to each task
+
+    tasks = pending.get('tasks', [])
+    if completed:
+        tasks += completed
+
+    status_opt = '$status'.strip().lower()
+    if status_opt in ('pending','completed'):
+        want = 0 if status_opt == 'pending' else 1
+        tasks = [t for t in tasks if int(t.get('status', 0)) == want]
+
     priority_map = {0: 'None', 1: 'Low', 3: 'Medium', 5: 'High'}
     status_map = {0: 'pending', 1: 'completed'}
-    
-    for task in tasks:
-        task['priority_text'] = priority_map.get(task.get('priority', 0), 'Unknown')
-        task['status_text'] = status_map.get(task.get('status', 0), 'Unknown')
-    
-    output = {
-        'success': True,
-        'count': len(tasks),
-        'list': '$list',
-        'tasks': tasks
-    }
-    
+    for t in tasks:
+        t['priority_text'] = priority_map.get(t.get('priority', 0), 'Unknown')
+        t['status_text'] = status_map.get(t.get('status', 0), 'Unknown')
+
+    output = {'success': True, 'count': len(tasks), 'list': '$list', 'tasks': tasks}
     indent = 2 if '$output_format' == 'json-pretty' else None
     print(json.dumps(output, indent=indent))
-    
 except Exception as e:
     print(json.dumps({'success': False, 'error': str(e)}, indent=2 if '$output_format' == 'json-pretty' else None))
 "
@@ -1625,7 +2033,13 @@ try:
         format_simple_table(error_msg, term_width)
         sys.exit(1)
     
-    tasks = data.get('tasks', [])
+    tasks_pending = data.get('tasks', [])
+    tasks_completed = data.get('completedTasks', [])
+    tasks = tasks_pending + tasks_completed
+    status_opt = '$status'.strip().lower()
+    if status_opt in ('pending','completed'):
+        want = 0 if status_opt == 'pending' else 1
+        tasks = [t for t in tasks if int(t.get('status', 0)) == want]
     
     if not tasks:
         format_simple_table('No tasks found in this list.', term_width)
@@ -2649,9 +3063,13 @@ show_usage() {
     echo "    --json, -j                                 JSON output"
     echo "    --json-pretty, -jp                         Pretty JSON output"
     echo ""
-    echo "  complete                       Mark task as complete"
-    echo "    --task <name or id>          Task name or ID to complete"
-    echo "    --list <name>                List name (required)"
+    echo "  complete [name]                Mark task as complete"
+    echo "    --name, -n     \"Name\"        Task name (optional if first arg provided)"
+    echo "    --id, -i       <taskId>      Task ID to complete"
+    echo "    --list, -l     \"List Name\"   List name (optional; scans all if omitted)"
+    echo "    --tag, -t      \"Tag\"         Add tag after completion"
+    echo "    --json, -j                   JSON output"
+    echo "    --json-pretty, -jp           Pretty JSON output"
     echo ""
     echo "  tasks                          Show tasks"
     echo "    --list \"List Name\"           Filter by list"
@@ -2670,7 +3088,8 @@ show_usage() {
     echo "Examples:"
     echo " task \"Fix bug\" --description \"Details here\" --list \"Work\" --priority \"High\" --due \"2025-01-15T14:30:00\" --tag \"Bug,High Priority\""
     echo " task \"Make Something Awesome folk's\" --list Work"
-    echo " complete --task \"Add Feature\" --list \"Home\""
+    echo " complete Add Feature --list Home"
+    echo " complete --id 617c54843c9fd1323e3900b0 --tag Done"
     echo " tasks --list \"Work\" --status completed"
     echo " list \"New Project\""
     echo " list --name \"Work\" --color \"#FF5733\""
